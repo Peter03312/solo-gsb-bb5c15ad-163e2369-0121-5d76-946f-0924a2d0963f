@@ -6,7 +6,10 @@ const toastEl = document.getElementById('toast');
 const connEl = document.getElementById('conn');
 
 const TYPE_TEXT = { light: '灯光', sound: '音效', set: '布景', other: '其他' };
-const STATUS_TEXT = { pending: '待执行', fired: '已触发', skipped: '已跳过', blocked: '受阻' };
+const STATUS_TEXT = {
+  pending: '待执行', fired: '已触发', review_fired: '已触发', skipped: '已跳过',
+  blocked: '受阻', review_pending: '待复核',
+};
 
 let toastTimer = null;
 let pollTimer = null;
@@ -219,6 +222,7 @@ function collectEditorCues() {
     type: c.type,
     description: c.description.trim(),
     deps: c.depsText.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
+    require_review: !!c.require_review,
   }));
 }
 
@@ -236,6 +240,7 @@ function renderEditorTable() {
       </td>
       <td><input type="text" data-i="${i}" data-f="description" value="${esc(c.description)}" placeholder="提示内容描述"></td>
       <td><input type="text" class="deps-input" data-i="${i}" data-f="depsText" value="${esc(c.depsText)}" placeholder="前置编号，逗号分隔"></td>
+      <td style="text-align:center"><input type="checkbox" class="review-input" data-i="${i}" data-f="require_review" ${c.require_review ? 'checked' : ''} title="勾选后现场触发需双人复核，发布后随版本锁定"></td>
       <td style="white-space:nowrap">
         <button class="ghost small" data-act="up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
         <button class="ghost small" data-act="down" data-i="${i}" ${i === editorCues.length - 1 ? 'disabled' : ''}>↓</button>
@@ -246,7 +251,7 @@ function renderEditorTable() {
   tbody.querySelectorAll('input,select').forEach(el => {
     el.onchange = el.oninput = () => {
       const i = Number(el.dataset.i);
-      editorCues[i][el.dataset.f] = el.value;
+      editorCues[i][el.dataset.f] = el.type === 'checkbox' ? el.checked : el.value;
     };
   });
   tbody.querySelectorAll('button').forEach(btn => {
@@ -285,7 +290,7 @@ async function renderVersion(id) {
         <p class="muted">发布于 ${fmtTime(version.published_at)}　${esc(version.note || '')}</p>
         <div class="panel">
           <table>
-            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th></tr></thead>
+            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>双人复核</th></tr></thead>
             <tbody>
               ${cues.map(c => `
                 <tr>
@@ -294,6 +299,7 @@ async function renderVersion(id) {
                   <td>${TYPE_TEXT[c.type] || c.type}</td>
                   <td>${esc(c.description)}</td>
                   <td>${c.deps.length ? c.deps.map(d => `<span class="dep-chip">${esc(d)}</span>`).join('') : '<span class="muted">无</span>'}</td>
+                  <td>${c.require_review ? '<span class="badge review">需复核</span>' : '<span class="muted">否</span>'}</td>
                 </tr>`).join('')}
             </tbody>
           </table>
@@ -314,17 +320,18 @@ async function renderVersion(id) {
       return;
     }
 
-    // 草稿编辑器
+      // 草稿编辑器
     editorCues = cues.map(c => ({
-      label: c.label, type: c.type, description: c.description, depsText: c.deps.join(', '),
+      label: c.label, type: c.type, description: c.description,
+      depsText: c.deps.join(', '), require_review: !!c.require_review,
     }));
 
     app.innerHTML = `
       <h1>执行单 v${version.version_number} <span class="badge draft">草稿</span></h1>
-      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。保存不影响已开始的演出。</p>
+      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。勾选「需复核」的提示，现场触发须双人复核；发布后标记随版本锁定。保存不影响已开始的演出。</p>
       <div class="panel">
         <table class="editor-table">
-          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>操作</th></tr></thead>
+          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th title="现场触发需双人复核">需复核</th><th>操作</th></tr></thead>
           <tbody id="editor-tbody"></tbody>
         </table>
         <div class="row" style="margin-top:12px">
@@ -342,7 +349,7 @@ async function renderVersion(id) {
     renderEditorTable();
 
     document.getElementById('add-cue').onclick = () => {
-      editorCues.push({ label: '', type: 'light', description: '', depsText: '' });
+      editorCues.push({ label: '', type: 'light', description: '', depsText: '', require_review: false });
       renderEditorTable();
     };
 
@@ -403,9 +410,11 @@ async function renderPerformance(id) {
   } catch (e) { app.innerHTML = `<div class="error-list">${esc(e.message)}</div>`; }
 }
 
-function drawPerformance(id, { performance: perf, cues, events }) {
-  const counts = { pending: 0, fired: 0, skipped: 0, blocked: 0 };
+function drawPerformance(id, { performance: perf, cues, events, reviews }) {
+  const counts = { pending: 0, fired: 0, review_fired: 0, skipped: 0, blocked: 0, review_pending: 0 };
   cues.forEach(c => counts[c.status]++);
+  const firedCount = counts.fired + counts.review_fired;
+  const pendingReviews = (reviews || []).filter(r => r.status === 'pending');
 
   const opVal = document.getElementById('operator-input')
     ? document.getElementById('operator-input').value
@@ -419,14 +428,16 @@ function drawPerformance(id, { performance: perf, cues, events }) {
         <span>开始：${fmtTime(perf.started_at)}</span>
         <span>启动人：${esc(perf.started_by || '-')}</span>
         <span class="status pending">待执行 ${counts.pending}</span>
-        <span class="status fired">已触发 ${counts.fired}</span>
+        <span class="status fired">已触发 ${firedCount}</span>
         <span class="status skipped">已跳过 ${counts.skipped}</span>
         <span class="status blocked">受阻 ${counts.blocked}</span>
+        <span class="status review_pending">待复核 ${counts.review_pending}</span>
         <span class="grow"></span>
         <label>操作人 <input id="operator-input" type="text" value="${esc(opVal)}" placeholder="姓名" style="width:110px"></label>
         <a href="#/shows/${perf.show_id}">返回场次</a>
       </div>
     </div>
+    ${reviews && reviews.length ? reviewPanelHtml(reviews) : ''}
     <div class="grid-2">
       <div id="cue-list">
         ${cues.map(c => cueCard(id, c)).join('')}
@@ -437,7 +448,7 @@ function drawPerformance(id, { performance: perf, cues, events }) {
         <ul>
           ${events.map(e => `
             <li>
-              <span class="status ${e.action}">${ACTION_TEXT(e.action)}</span>
+              <span class="status ${eventStatusClass(e.action)}">${ACTION_TEXT(e.action)}</span>
               <b>${esc(e.label)}</b><br>
               <span class="muted">${esc(e.operator)} · ${fmtTime(e.created_at)}${e.reason ? '<br>原因：' + esc(e.reason) : ''}</span>
             </li>`).join('')}
@@ -452,14 +463,87 @@ function drawPerformance(id, { performance: perf, cues, events }) {
     const fireBtn = document.getElementById(`fire-${c.id}`);
     const skipBtn = document.getElementById(`skip-${c.id}`);
     const retractBtn = document.getElementById(`retract-${c.id}`);
+    const applyBtn = document.getElementById(`apply-review-${c.id}`);
     if (fireBtn) fireBtn.onclick = () => doFire(id, c.id);
     if (skipBtn) skipBtn.onclick = () => doSkip(id, c.id);
     if (retractBtn) retractBtn.onclick = () => doRetract(id, c.id);
+    if (applyBtn) applyBtn.onclick = () => doApplyReview(id, c.id);
+  });
+
+  pendingReviews.forEach(r => {
+    const confirmBtn = document.getElementById(`confirm-review-${r.id}`);
+    const cancelBtn = document.getElementById(`cancel-review-${r.id}`);
+    const rejectBtn = document.getElementById(`reject-review-${r.id}`);
+    if (confirmBtn) confirmBtn.onclick = () => doConfirmReview(id, r.id);
+    if (cancelBtn) cancelBtn.onclick = () => doCancelReview(id, r.id);
+    if (rejectBtn) rejectBtn.onclick = () => doRejectReview(id, r.id);
   });
 }
 
 function ACTION_TEXT(a) {
-  return a === 'fired' ? '已触发' : a === 'skipped' ? '已跳过' : '已撤回';
+  if (a === 'fired') return '已触发';
+  if (a === 'review_fired') return '已触发（双人复核）';
+  if (a === 'skipped') return '已跳过';
+  return '已撤回';
+}
+
+// review_fired 在状态色上按"已触发"显示
+function eventStatusClass(a) {
+  return isFiredLike(a) ? 'fired' : a;
+}
+function isFiredLike(a) {
+  return a === 'fired' || a === 'review_fired';
+}
+
+const REVIEW_STATUS_TEXT_UI = {
+  pending: '待处理', confirmed: '已确认触发', cancelled: '申请人已撤销', rejected: '已驳回',
+};
+
+function reviewResultHtml(r) {
+  if (r.status === 'confirmed') {
+    return `<span class="muted">确认人 ${esc(r.confirmer)} · ${fmtTime(r.confirmed_at)}</span>`;
+  }
+  if (r.status === 'cancelled') {
+    return `<span class="muted">${esc(r.cancel_operator)} 撤销 · ${fmtTime(r.cancelled_at)}</span>`;
+  }
+  if (r.status === 'rejected') {
+    return `<span class="muted">${esc(r.reject_operator)} 驳回 · ${fmtTime(r.rejected_at)}${r.reject_reason ? ' · 原因：' + esc(r.reject_reason) : ''}</span>`;
+  }
+  return '';
+}
+
+function reviewPanelHtml(list) {
+  const pending = list.filter(r => r.status === 'pending');
+  const done = list.filter(r => r.status !== 'pending');
+  const badge = r => `<span class="badge review-status-${r.status}">${REVIEW_STATUS_TEXT_UI[r.status] || r.status}</span>`;
+  return `
+    <div class="panel review-panel">
+      <b>🛡️ 双人复核申请（待处理 ${pending.length} / 共 ${list.length}）</b>
+      <p class="muted" style="margin:6px 0 10px">申请发起后提示尚未触发、下游仍受阻；须由<b>申请人之外</b>的另一位操作人在前置全部已触发后确认。确认 / 撤销 / 驳回全程留痕。</p>
+      <table class="review-table">
+        <thead><tr><th>提示</th><th>状态</th><th>申请</th><th>处置 / 操作</th></tr></thead>
+        <tbody>
+          ${pending.map(r => `
+            <tr>
+              <td><b>${esc(r.label)}</b></td>
+              <td>${badge(r)}</td>
+              <td>${esc(r.applicant)}<br><span class="muted">${fmtTime(r.applied_at)}</span></td>
+              <td class="review-ops">
+                <button class="small" id="confirm-review-${r.id}">确认触发</button>
+                <button class="small ghost" id="cancel-review-${r.id}">撤销</button>
+                <button class="small danger" id="reject-review-${r.id}">驳回</button>
+              </td>
+            </tr>`).join('')}
+          ${done.map(r => `
+            <tr class="review-done">
+              <td><b>${esc(r.label)}</b></td>
+              <td>${badge(r)}</td>
+              <td>${esc(r.applicant)}<br><span class="muted">${fmtTime(r.applied_at)}</span></td>
+              <td>${reviewResultHtml(r)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
 }
 
 function cueCard(perfId, c) {
@@ -469,30 +553,53 @@ function cueCard(perfId, c) {
   const eventHtml = c.event
     ? `<div class="cue-event">${ACTION_TEXT(c.event.action)} · ${esc(c.event.operator)} · ${fmtTime(c.event.created_at)}${c.event.reason ? ' · 原因：' + esc(c.event.reason) : ''}</div>`
     : '';
-  const blockedHtml = c.status === 'blocked'
+  const blockedHtml = (c.status === 'blocked' || (c.status === 'review_pending' && c.unmet.length))
     ? `<div class="cue-event"><span class="unmet">受阻：前置 ${c.unmet.map(esc).join('、')} 未触发</span></div>`
     : '';
-  const canAct = c.status === 'pending';
-  const done = c.status === 'fired' || c.status === 'skipped';
-  const canRetract = c.status === 'fired';
+  const reviewNoteHtml = c.status === 'review_pending'
+    ? `<div class="cue-event review-note">🛡️ 双人复核申请中：${esc(c.review_request.applicant)} 于 ${fmtTime(c.review_request.applied_at)} 发起，等待另一位操作人确认；提示尚未触发</div>`
+    : '';
+  const reviewBadge = c.require_review ? '<span class="badge review" title="该提示触发需双人复核">需复核</span>' : '';
+
+  const done = isFiredLike(c.status) || c.status === 'skipped';
+  const canRetract = isFiredLike(c.status);
+  const cardClass = isFiredLike(c.status) ? 'fired' : c.status;
+
+  let actionsHtml;
+  if (c.require_review && !done) {
+    // 需复核提示：用"发起复核"替代直接触发；待处理期间申请按钮也禁用
+    actionsHtml = `
+      <button id="apply-review-${c.id}" class="review-btn" ${c.status === 'review_pending' ? 'disabled' : ''}>
+        ${c.status === 'review_pending' ? '待复核' : '发起复核'}
+      </button>
+      <button id="skip-${c.id}" class="ghost" disabled>跳过</button>
+      <button id="retract-${c.id}" class="danger" disabled>撤回</button>`;
+  } else {
+    const canAct = c.status === 'pending';
+    actionsHtml = `
+      <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>触发</button>
+      <button id="skip-${c.id}" class="ghost" ${done ? 'disabled' : ''}>跳过</button>
+      <button id="retract-${c.id}" class="danger" ${canRetract ? '' : 'disabled'}>撤回</button>`;
+  }
+
   return `
-    <div class="cue-card ${c.status}">
+    <div class="cue-card ${cardClass}">
       <div class="cue-seq">${c.seq}</div>
       <div class="cue-main">
         <div class="cue-title">
           <span class="cue-label">${esc(c.label)}</span>
           <span class="cue-type">${TYPE_TEXT[c.type] || c.type}</span>
-          <span class="status ${c.status}">${STATUS_TEXT[c.status]}</span>
+          ${reviewBadge}
+          <span class="status ${cardClass}">${STATUS_TEXT[c.status] || c.status}</span>
         </div>
         ${c.description ? `<div class="cue-desc">${esc(c.description)}</div>` : ''}
         <div class="cue-deps">前置：${depsHtml}</div>
         ${blockedHtml}
+        ${reviewNoteHtml}
         ${eventHtml}
       </div>
       <div class="cue-actions">
-        <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>触发</button>
-        <button id="skip-${c.id}" class="ghost" ${done ? 'disabled' : ''}>跳过</button>
-        <button id="retract-${c.id}" class="danger" ${canRetract ? '' : 'disabled'}>撤回</button>
+        ${actionsHtml}
       </div>
     </div>`;
 }
@@ -539,6 +646,73 @@ async function doRetract(perfId, cueId) {
     toast('已撤回，该提示可重新执行');
   } catch (e) {
     // 409：当前状态不允许撤回，或下游仍有已触发提示（消息含受影响编号）
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+/* ---------- 双人复核 ---------- */
+
+async function doApplyReview(perfId, cueId) {
+  const applicant = getOperator();
+  if (!applicant) { toast('请先填写操作人（即申请人）', true); return document.getElementById('operator-input').focus(); }
+  try {
+    await api(`/api/performances/${perfId}/review-requests`, {
+      method: 'POST', body: { cue_id: cueId, applicant },
+    });
+    toast('复核申请已发起：提示尚未触发，等待另一位操作人确认');
+  } catch (e) {
+    toast(e.message, true); // 409 重复申请 / 422 无需复核等
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doConfirmReview(perfId, reviewId) {
+  const confirmer = getOperator();
+  if (!confirmer) { toast('请先填写操作人（即确认人）', true); return document.getElementById('operator-input').focus(); }
+  try {
+    await api(`/api/review-requests/${reviewId}/confirm`, {
+      method: 'POST', body: { confirmer },
+    });
+    toast('已确认，提示触发成功');
+  } catch (e) {
+    // 400 确认人=申请人；422 前置未全部触发（申请保持待处理）；409 已被并发处理
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doCancelReview(perfId, reviewId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人', true); return document.getElementById('operator-input').focus(); }
+  try {
+    await api(`/api/review-requests/${reviewId}/cancel`, {
+      method: 'POST', body: { operator },
+    });
+    toast('申请已撤销');
+  } catch (e) {
+    // 403 非申请人；409 已被并发处理
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doRejectReview(perfId, reviewId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt('请填写驳回原因（必填）：');
+  if (reason == null) return;
+  if (!reason.trim()) return toast('驳回必须填写原因', true);
+  try {
+    await api(`/api/review-requests/${reviewId}/reject`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast('申请已驳回');
+  } catch (e) {
     toast(e.message, true);
   }
   stopPolling();

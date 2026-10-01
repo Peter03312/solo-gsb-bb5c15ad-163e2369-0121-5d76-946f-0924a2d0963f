@@ -165,3 +165,23 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .event-log ul { padding-left: 0; margin: 0; }
 .grid-2 { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
 @media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* 双人复核 */
+:root {
+  --review: #c792ea;
+}
+.badge.review { background: #2c2140; color: var(--review); border: 1px solid #4a3a66; }
+.status.review_pending, .status.review_fired { color: var(--review); }
+.cue-card.review_pending { border-left-color: var(--review); }
+.cue-event.review-note { color: var(--review); }
+button.review-btn { background: #6c4ea8; }
+
+.review-panel { border-color: #4a3a66; background: #221d31; }
+.review-table { margin-top: 8px; }
+.review-table tr.review-done { opacity: 0.72; }
+.review-ops { display: flex; gap: 6px; flex-wrap: wrap; }
+.review-ops button { padding: 4px 10px; font-size: 13px; }
+.badge.review-status-pending { background: #2c2140; color: var(--review); border-color: var(--review); }
+.badge.review-status-confirmed { background: #14342a; color: var(--fired); border-color: var(--fired); }
+.badge.review-status-cancelled, .badge.review-status-rejected { background: #2b2f3a; color: var(--muted); border-color: var(--border); }
+.badge.review-status-rejected { color: #e0929a; }
