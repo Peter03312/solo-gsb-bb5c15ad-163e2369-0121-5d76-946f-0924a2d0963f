@@ -7,6 +7,7 @@ const connEl = document.getElementById('conn');
 
 const TYPE_TEXT = { light: '灯光', sound: '音效', set: '布景', other: '其他' };
 const STATUS_TEXT = { pending: '待执行', fired: '已触发', skipped: '已跳过', blocked: '受阻' };
+const REQUEST_STATUS_TEXT = { pending: '待复核', confirmed: '已确认', cancelled: '已撤销', rejected: '已驳回' };
 
 let toastTimer = null;
 let pollTimer = null;
@@ -219,6 +220,7 @@ function collectEditorCues() {
     type: c.type,
     description: c.description.trim(),
     deps: c.depsText.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
+    needs_review: !!c.needs_review,
   }));
 }
 
@@ -236,6 +238,7 @@ function renderEditorTable() {
       </td>
       <td><input type="text" data-i="${i}" data-f="description" value="${esc(c.description)}" placeholder="提示内容描述"></td>
       <td><input type="text" class="deps-input" data-i="${i}" data-f="depsText" value="${esc(c.depsText)}" placeholder="前置编号，逗号分隔"></td>
+      <td style="text-align:center"><input type="checkbox" data-i="${i}" data-f="needs_review" ${c.needs_review ? 'checked' : ''} title="现场触发需另一操作人复核确认"></td>
       <td style="white-space:nowrap">
         <button class="ghost small" data-act="up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
         <button class="ghost small" data-act="down" data-i="${i}" ${i === editorCues.length - 1 ? 'disabled' : ''}>↓</button>
@@ -246,7 +249,8 @@ function renderEditorTable() {
   tbody.querySelectorAll('input,select').forEach(el => {
     el.onchange = el.oninput = () => {
       const i = Number(el.dataset.i);
-      editorCues[i][el.dataset.f] = el.value;
+      const f = el.dataset.f;
+      editorCues[i][f] = el.type === 'checkbox' ? el.checked : el.value;
     };
   });
   tbody.querySelectorAll('button').forEach(btn => {
@@ -285,7 +289,7 @@ async function renderVersion(id) {
         <p class="muted">发布于 ${fmtTime(version.published_at)}　${esc(version.note || '')}</p>
         <div class="panel">
           <table>
-            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th></tr></thead>
+            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th></tr></thead>
             <tbody>
               ${cues.map(c => `
                 <tr>
@@ -294,6 +298,7 @@ async function renderVersion(id) {
                   <td>${TYPE_TEXT[c.type] || c.type}</td>
                   <td>${esc(c.description)}</td>
                   <td>${c.deps.length ? c.deps.map(d => `<span class="dep-chip">${esc(d)}</span>`).join('') : '<span class="muted">无</span>'}</td>
+                  <td>${c.needs_review ? '<span class="badge review">双人复核</span>' : '<span class="muted">—</span>'}</td>
                 </tr>`).join('')}
             </tbody>
           </table>
@@ -317,14 +322,15 @@ async function renderVersion(id) {
     // 草稿编辑器
     editorCues = cues.map(c => ({
       label: c.label, type: c.type, description: c.description, depsText: c.deps.join(', '),
+      needs_review: !!c.needs_review,
     }));
 
     app.innerHTML = `
       <h1>执行单 v${version.version_number} <span class="badge draft">草稿</span></h1>
-      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。保存不影响已开始的演出。</p>
+      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。勾选「复核」的提示现场触发时需另一操作人确认。保存不影响已开始的演出。</p>
       <div class="panel">
         <table class="editor-table">
-          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>操作</th></tr></thead>
+          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>操作</th></tr></thead>
           <tbody id="editor-tbody"></tbody>
         </table>
         <div class="row" style="margin-top:12px">
@@ -403,9 +409,12 @@ async function renderPerformance(id) {
   } catch (e) { app.innerHTML = `<div class="error-list">${esc(e.message)}</div>`; }
 }
 
-function drawPerformance(id, { performance: perf, cues, events }) {
+function drawPerformance(id, { performance: perf, cues, events, review_requests: reviewRequests }) {
   const counts = { pending: 0, fired: 0, skipped: 0, blocked: 0 };
   cues.forEach(c => counts[c.status]++);
+  const requests = reviewRequests || [];
+  const pendingReqs = requests.filter(r => r.status === 'pending');
+  const resolvedReqs = requests.filter(r => r.status !== 'pending');
 
   const opVal = document.getElementById('operator-input')
     ? document.getElementById('operator-input').value
@@ -422,6 +431,7 @@ function drawPerformance(id, { performance: perf, cues, events }) {
         <span class="status fired">已触发 ${counts.fired}</span>
         <span class="status skipped">已跳过 ${counts.skipped}</span>
         <span class="status blocked">受阻 ${counts.blocked}</span>
+        ${pendingReqs.length ? `<span class="status review-pending">待复核 ${pendingReqs.length}</span>` : ''}
         <span class="grow"></span>
         <label>操作人 <input id="operator-input" type="text" value="${esc(opVal)}" placeholder="姓名" style="width:110px"></label>
         <a href="#/shows/${perf.show_id}">返回场次</a>
@@ -431,17 +441,47 @@ function drawPerformance(id, { performance: perf, cues, events }) {
       <div id="cue-list">
         ${cues.map(c => cueCard(id, c)).join('')}
       </div>
-      <div class="panel event-log">
-        <b>执行记录（最新在上）</b>
-        ${events.length === 0 ? '<p class="muted">暂无记录</p>' : `
-        <ul>
-          ${events.map(e => `
-            <li>
-              <span class="status ${e.action}">${ACTION_TEXT(e.action)}</span>
-              <b>${esc(e.label)}</b><br>
-              <span class="muted">${esc(e.operator)} · ${fmtTime(e.created_at)}${e.reason ? '<br>原因：' + esc(e.reason) : ''}</span>
-            </li>`).join('')}
-        </ul>`}
+      <div>
+        <div class="panel review-panel">
+          <b>复核申请（待处理 ${pendingReqs.length}）</b>
+          ${pendingReqs.length === 0 ? '<p class="muted">暂无待复核申请</p>' : `
+          <ul>
+            ${pendingReqs.map(r => `
+              <li>
+                <span class="status review-pending">待复核</span>
+                <b>${esc(r.label)}</b><br>
+                <span class="muted">申请人 ${esc(r.requested_by)} · ${fmtTime(r.requested_at)}</span><br>
+                <span class="review-actions">
+                  <button class="small" data-req-act="confirm" data-req="${r.id}">确认触发</button>
+                  <button class="danger small" data-req-act="reject" data-req="${r.id}">驳回</button>
+                  <button class="ghost small" data-req-act="cancel" data-req="${r.id}">撤销</button>
+                </span>
+              </li>`).join('')}
+          </ul>`}
+          ${resolvedReqs.length === 0 ? '' : `
+          <b class="review-history-title">处置记录</b>
+          <ul>
+            ${resolvedReqs.map(r => `
+              <li>
+                <span class="status review-${r.status}">${REQUEST_STATUS_TEXT[r.status]}</span>
+                <b>${esc(r.label)}</b><br>
+                <span class="muted">申请人 ${esc(r.requested_by)} · ${fmtTime(r.requested_at)}<br>
+                处置 ${esc(r.resolved_by || '-')} · ${fmtTime(r.resolved_at)}${r.resolve_reason ? '<br>原因：' + esc(r.resolve_reason) : ''}</span>
+              </li>`).join('')}
+          </ul>`}
+        </div>
+        <div class="panel event-log">
+          <b>执行记录（最新在上）</b>
+          ${events.length === 0 ? '<p class="muted">暂无记录</p>' : `
+          <ul>
+            ${events.map(e => `
+              <li>
+                <span class="status ${e.action}">${ACTION_TEXT(e.action)}</span>
+                <b>${esc(e.label)}</b><br>
+                <span class="muted">${esc(e.operator)} · ${fmtTime(e.created_at)}${e.reason ? '<br>原因：' + esc(e.reason) : ''}</span>
+              </li>`).join('')}
+          </ul>`}
+        </div>
       </div>
     </div>`;
 
@@ -455,6 +495,16 @@ function drawPerformance(id, { performance: perf, cues, events }) {
     if (fireBtn) fireBtn.onclick = () => doFire(id, c.id);
     if (skipBtn) skipBtn.onclick = () => doSkip(id, c.id);
     if (retractBtn) retractBtn.onclick = () => doRetract(id, c.id);
+  });
+
+  app.querySelectorAll('[data-req-act]').forEach(btn => {
+    btn.onclick = () => {
+      const reqId = btn.dataset.req;
+      const act = btn.dataset.reqAct;
+      if (act === 'confirm') doConfirmRequest(id, reqId);
+      else if (act === 'reject') doRejectRequest(id, reqId);
+      else if (act === 'cancel') doCancelRequest(id, reqId);
+    };
   });
 }
 
@@ -472,9 +522,14 @@ function cueCard(perfId, c) {
   const blockedHtml = c.status === 'blocked'
     ? `<div class="cue-event"><span class="unmet">受阻：前置 ${c.unmet.map(esc).join('、')} 未触发</span></div>`
     : '';
-  const canAct = c.status === 'pending';
+  const req = c.pending_request;
+  const reviewHtml = req
+    ? `<div class="cue-event"><span class="review-pending-text">待复核：${esc(req.requested_by)} 于 ${fmtTime(req.requested_at)} 申请触发，需另一操作人确认</span></div>`
+    : '';
+  const canAct = c.status === 'pending' && !req;
   const done = c.status === 'fired' || c.status === 'skipped';
   const canRetract = c.status === 'fired';
+  const fireLabel = c.needs_review ? '申请触发' : '触发';
   return `
     <div class="cue-card ${c.status}">
       <div class="cue-seq">${c.seq}</div>
@@ -482,16 +537,18 @@ function cueCard(perfId, c) {
         <div class="cue-title">
           <span class="cue-label">${esc(c.label)}</span>
           <span class="cue-type">${TYPE_TEXT[c.type] || c.type}</span>
+          ${c.needs_review ? '<span class="badge review">双人复核</span>' : ''}
           <span class="status ${c.status}">${STATUS_TEXT[c.status]}</span>
         </div>
         ${c.description ? `<div class="cue-desc">${esc(c.description)}</div>` : ''}
         <div class="cue-deps">前置：${depsHtml}</div>
         ${blockedHtml}
+        ${reviewHtml}
         ${eventHtml}
       </div>
       <div class="cue-actions">
-        <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>触发</button>
-        <button id="skip-${c.id}" class="ghost" ${done ? 'disabled' : ''}>跳过</button>
+        <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>${fireLabel}</button>
+        <button id="skip-${c.id}" class="ghost" ${done || req ? 'disabled' : ''}>跳过</button>
         <button id="retract-${c.id}" class="danger" ${canRetract ? '' : 'disabled'}>撤回</button>
       </div>
     </div>`;
@@ -501,7 +558,8 @@ async function doFire(perfId, cueId) {
   const operator = getOperator();
   if (!operator) { toast('请先填写操作人', true); return document.getElementById('operator-input').focus(); }
   try {
-    await api(`/api/performances/${perfId}/cues/${cueId}/fire`, { method: 'POST', body: { operator } });
+    const r = await api(`/api/performances/${perfId}/cues/${cueId}/fire`, { method: 'POST', body: { operator } });
+    if (r.request) toast('已提交触发申请，待另一操作人复核确认');
   } catch (e) {
     toast(e.message, true); // 409 冲突 / 422 受阻等，消息含当前状态
   }
@@ -539,6 +597,58 @@ async function doRetract(perfId, cueId) {
     toast('已撤回，该提示可重新执行');
   } catch (e) {
     // 409：当前状态不允许撤回，或下游仍有已触发提示（消息含受影响编号）
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+/* ---------- 双人复核：确认 / 驳回 / 撤销 ---------- */
+
+async function doConfirmRequest(perfId, reqId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（须与申请人不同）', true); return document.getElementById('operator-input').focus(); }
+  try {
+    await api(`/api/performances/${perfId}/review-requests/${reqId}/confirm`, {
+      method: 'POST', body: { operator },
+    });
+    toast('已确认，提示触发成功');
+  } catch (e) {
+    // 409：申请已处置 / 确认人与申请人相同；422：前置未触发（申请保持待复核）
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doRejectRequest(perfId, reqId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt('请填写驳回原因（必填）：');
+  if (reason == null) return;
+  if (!reason.trim()) return toast('驳回必须填写原因', true);
+  try {
+    await api(`/api/performances/${perfId}/review-requests/${reqId}/reject`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast('已驳回该申请');
+  } catch (e) {
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doCancelRequest(perfId, reqId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（须为申请人本人）', true); return document.getElementById('operator-input').focus(); }
+  try {
+    await api(`/api/performances/${perfId}/review-requests/${reqId}/cancel`, {
+      method: 'POST', body: { operator },
+    });
+    toast('已撤销该申请');
+  } catch (e) {
+    // 409：非申请人本人 / 申请已处置
     toast(e.message, true);
   }
   stopPolling();

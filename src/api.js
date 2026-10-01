@@ -2,10 +2,11 @@
 /**
  * API 路由与业务逻辑。
  * 错误约定：返回 { error: 消息, ... } ，状态码语义：
- *   400 参数/前置条件错误（含无已发布版本、版本未发布、跳过/撤回缺原因）
+ *   400 参数/前置条件错误（含无已发布版本、版本未发布、跳过/撤回/驳回缺原因）
  *   404 资源不存在
- *   409 冲突（提示已有结果、版本已发布不可改、撤回时当前状态不允许或下游仍已触发）
- *   422 校验未通过（缺失引用/循环依赖）或前置未触发（受阻）
+ *   409 冲突（提示已有结果、版本已发布不可改、撤回时当前状态不允许或下游仍已触发、
+ *       复核申请重复/已处置/处置人身份不符、待复核期间跳过或撤回）
+ *   422 校验未通过（缺失引用/循环依赖）或前置未触发（受阻，含复核确认时前置失效）
  */
 const { db, withTx } = require('./db');
 const { validateCues, CUE_TYPES } = require('./validate');
@@ -21,6 +22,7 @@ class HttpError extends Error {
 /* ---------------- 工具 ---------------- */
 
 const ACTION_TEXT = { fired: '已触发', skipped: '已跳过', retracted: '已撤回' };
+const REQUEST_STATUS_TEXT = { pending: '待复核', confirmed: '已确认', cancelled: '已撤销', rejected: '已驳回' };
 
 function sanitizeCue(raw) {
   const deps = Array.isArray(raw && raw.deps) ? raw.deps : [];
@@ -29,6 +31,7 @@ function sanitizeCue(raw) {
     type: CUE_TYPES.includes(raw && raw.type) ? raw.type : 'other',
     description: String((raw && raw.description) != null ? raw.description : '').trim().slice(0, 500),
     deps: [...new Set(deps.map((d) => String(d).trim()).filter(Boolean))].slice(0, 50),
+    needs_review: raw && raw.needs_review ? 1 : 0,
   };
 }
 
@@ -73,6 +76,33 @@ function latestEventsByCue(performanceId) {
 
 function effectiveAction(latest) {
   return latest && latest.action !== 'retracted' ? latest.action : null;
+}
+
+/** 演出与提示的存在性校验（提示须属于演出锁定的版本），供各写操作复用 */
+function getPerfCue(performanceId, cueId) {
+  const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+  if (!perf) throw new HttpError(404, '演出不存在');
+  const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND version_id = ?').get(cueId, perf.version_id);
+  if (!cue) throw new HttpError(404, '该提示不属于此演出使用的版本');
+  return { perf, cue };
+}
+
+/** 该演出某提示当前待复核的申请（无则 null）。须在事务内调用以保证判定一致 */
+function pendingRequestFor(performanceId, cueId) {
+  return db.prepare(
+    "SELECT * FROM cue_review_requests WHERE performance_id = ? AND cue_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1"
+  ).get(performanceId, cueId) || null;
+}
+
+/** 当前有效结果为"已触发"的提示编号集合（已撤回的不算） */
+function firedLabelSet(versionId, latestByCue) {
+  const rows = db.prepare('SELECT id, label FROM cues WHERE version_id = ?').all(versionId);
+  return new Set(
+    rows.filter((r) => {
+      const e = latestByCue.get(r.id);
+      return e && e.action === 'fired';
+    }).map((r) => r.label)
+  );
 }
 
 /* ---------------- 路由表 ---------------- */
@@ -141,8 +171,8 @@ route('POST', '/api/shows/:id/versions', (body, p) => {
     const newId = Number(info.lastInsertRowid);
     if (base) {
       const cues = db.prepare('SELECT * FROM cues WHERE version_id = ? ORDER BY seq').all(base.id);
-      const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps) VALUES (?,?,?,?,?,?)');
-      for (const c of cues) ins.run(newId, c.seq, c.label, c.type, c.description, c.deps);
+      const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review) VALUES (?,?,?,?,?,?,?)');
+      for (const c of cues) ins.run(newId, c.seq, c.label, c.type, c.description, c.deps, c.needs_review);
     }
     return { version: getVersion(newId), cues: getVersionCues(newId) };
   });
@@ -164,8 +194,8 @@ route('PUT', '/api/versions/:id/cues', (body, p) => {
   const cues = body.cues.map(sanitizeCue);
   withTx(() => {
     db.prepare('DELETE FROM cues WHERE version_id = ?').run(version.id);
-    const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps) VALUES (?,?,?,?,?,?)');
-    cues.forEach((c, i) => ins.run(version.id, i + 1, c.label, c.type, c.description, JSON.stringify(c.deps)));
+    const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review) VALUES (?,?,?,?,?,?,?)');
+    cues.forEach((c, i) => ins.run(version.id, i + 1, c.label, c.type, c.description, JSON.stringify(c.deps), c.needs_review));
   });
   // 草稿允许暂存不完整内容，同时返回校验结果供界面提示
   return { ok: true, errors: validateCues(cues), cues: getVersionCues(version.id) };
@@ -258,34 +288,46 @@ route('GET', '/api/performances/:id', (body, p) => {
     return { ...c, status, unmet, event };
   });
 
-  return { performance: perf, cues: cueStates, events: events.slice().reverse() };
+  // 双人复核申请流水（最新在上）；待复核申请同时挂到对应提示上，便于执行台禁用操作
+  const reviewRequests = db.prepare(`
+    SELECT r.*, c.label, c.seq FROM cue_review_requests r
+    JOIN cues c ON c.id = r.cue_id
+    WHERE r.performance_id = ? ORDER BY r.id DESC
+  `).all(perf.id);
+  const pendingByCue = new Map();
+  for (const r of reviewRequests) {
+    if (r.status === 'pending' && !pendingByCue.has(r.cue_id)) pendingByCue.set(r.cue_id, r);
+  }
+  for (const c of cueStates) c.pending_request = pendingByCue.get(c.id) || null;
+
+  return { performance: perf, cues: cueStates, events: events.slice().reverse(), review_requests: reviewRequests };
 });
 
 /* ---- 触发 / 跳过 / 撤回（并发安全：BEGIN IMMEDIATE 事务内读最新事件再判定写入） ---- */
 
 function recordEvent(performanceId, cueId, action, operator, reason) {
   return withTx(() => {
-    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
-    if (!perf) throw new HttpError(404, '演出不存在');
-
-    const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND version_id = ?').get(cueId, perf.version_id);
-    if (!cue) throw new HttpError(404, '该提示不属于此演出使用的版本');
+    const { perf, cue } = getPerfCue(performanceId, cueId);
 
     const latestByCue = latestEventsByCue(performanceId);
     const current = latestByCue.get(cueId) || null;
     if (effectiveAction(current)) throw conflictError(current);
 
+    // 待复核申请处理前，该提示禁止跳过（fire 对需复核提示已在路由层转为登记申请，不会走到这里）
+    const pending = pendingRequestFor(performanceId, cueId);
+    if (pending) {
+      throw new HttpError(
+        409,
+        `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能${action === 'skipped' ? '跳过' : '触发'}`,
+        { request: pending }
+      );
+    }
+
     if (action === 'fired') {
       const deps = JSON.parse(cue.deps);
       if (deps.length) {
         // 前置是否满足以"当前有效结果为已触发"判定（已撤回的前置不算）
-        const labels = db.prepare('SELECT id, label FROM cues WHERE version_id = ?').all(perf.version_id);
-        const fired = new Set(
-          labels.filter((r) => {
-            const e = latestByCue.get(r.id);
-            return e && e.action === 'fired';
-          }).map((r) => r.label)
-        );
+        const fired = firedLabelSet(perf.version_id, latestByCue);
         const unmet = deps.filter((d) => !fired.has(d));
         if (unmet.length) {
           throw new HttpError(422, `前置提示未触发，无法触发：${unmet.join('、')}`, { unmet });
@@ -307,11 +349,17 @@ function recordEvent(performanceId, cueId, action, operator, reason) {
  */
 function retractEvent(performanceId, cueId, operator, reason) {
   return withTx(() => {
-    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
-    if (!perf) throw new HttpError(404, '演出不存在');
+    const { perf, cue } = getPerfCue(performanceId, cueId);
 
-    const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND version_id = ?').get(cueId, perf.version_id);
-    if (!cue) throw new HttpError(404, '该提示不属于此演出使用的版本');
+    // 待复核申请处理前禁止撤回（此时提示本就无有效结果，这里给出更明确的错误）
+    const pending = pendingRequestFor(performanceId, cueId);
+    if (pending) {
+      throw new HttpError(
+        409,
+        `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能撤回`,
+        { request: pending }
+      );
+    }
 
     const latestByCue = latestEventsByCue(performanceId);
     const latest = latestByCue.get(cueId) || null;
@@ -364,10 +412,166 @@ function retractEvent(performanceId, cueId, operator, reason) {
   });
 }
 
+/* ---- 双人复核：触发申请 / 确认 / 撤销 / 驳回 ---- */
+
+/**
+ * 登记触发申请：仅登记申请人与时间，提示不算已触发、下游前置仍受阻。
+ * 重复申请（已有待复核）或提示已有结果时 409。前置是否满足在确认时才判定，申请阶段不限制。
+ */
+function createReviewRequest(performanceId, cueId, operator) {
+  return withTx(() => {
+    const { cue } = getPerfCue(performanceId, cueId);
+
+    const latestByCue = latestEventsByCue(performanceId);
+    const current = latestByCue.get(cueId) || null;
+    if (effectiveAction(current)) throw conflictError(current);
+
+    const existing = pendingRequestFor(performanceId, cueId);
+    if (existing) {
+      throw new HttpError(
+        409,
+        `该提示已存在待复核的触发申请（申请人 ${existing.requested_by}，时间 ${existing.requested_at}），请勿重复申请`,
+        { request: existing }
+      );
+    }
+
+    const info = db.prepare(
+      'INSERT INTO cue_review_requests (performance_id, cue_id, requested_by) VALUES (?,?,?)'
+    ).run(performanceId, cueId, operator);
+    return { request: db.prepare('SELECT * FROM cue_review_requests WHERE id = ?').get(Number(info.lastInsertRowid)) };
+  });
+}
+
+/** 取申请并校验属于该演出 */
+function getReviewRequest(performanceId, requestId) {
+  const req = db.prepare(
+    'SELECT * FROM cue_review_requests WHERE id = ? AND performance_id = ?'
+  ).get(requestId, performanceId);
+  if (!req) throw new HttpError(404, '复核申请不存在');
+  return req;
+}
+
+function requestConflict(req) {
+  return new HttpError(
+    409,
+    `该申请已处置：${REQUEST_STATUS_TEXT[req.status]}（处置人 ${req.resolved_by || '-'}，时间 ${req.resolved_at || '-'}）`,
+    { request: req }
+  );
+}
+
+/**
+ * 确认申请：须为申请人之外的另一操作人；且前置当前均已触发，否则 422 且申请保持待复核。
+ * 确认与撤销/驳回在同一事务内判定，并发只有一种结局。确认后写入有效 fired 流水并关联申请。
+ */
+function confirmReviewRequest(performanceId, requestId, operator) {
+  return withTx(() => {
+    const req = getReviewRequest(performanceId, requestId);
+    if (req.status !== 'pending') throw requestConflict(req);
+    if (req.requested_by === operator) {
+      throw new HttpError(409, '复核确认人不能与申请人相同，须由另一操作人确认', { request: req });
+    }
+
+    const { perf, cue } = getPerfCue(performanceId, req.cue_id);
+    const latestByCue = latestEventsByCue(performanceId);
+    const current = latestByCue.get(req.cue_id) || null;
+    if (effectiveAction(current)) throw conflictError(current);
+
+    // 前置失效（未触发或已撤回）时拒绝确认，申请保持待复核
+    const deps = JSON.parse(cue.deps);
+    if (deps.length) {
+      const fired = firedLabelSet(perf.version_id, latestByCue);
+      const unmet = deps.filter((d) => !fired.has(d));
+      if (unmet.length) {
+        throw new HttpError(422, `前置提示未触发，无法确认：${unmet.join('、')}`, { unmet, request: req });
+      }
+    }
+
+    const evInfo = db.prepare(
+      'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)'
+    ).run(performanceId, req.cue_id, 'fired', operator, `双人复核确认（申请人：${req.requested_by}）`);
+    const eventId = Number(evInfo.lastInsertRowid);
+    db.prepare(
+      "UPDATE cue_review_requests SET status = 'confirmed', resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), event_id = ? WHERE id = ?"
+    ).run(operator, eventId, req.id);
+    return {
+      request: db.prepare('SELECT * FROM cue_review_requests WHERE id = ?').get(req.id),
+      event: db.prepare('SELECT * FROM cue_events WHERE id = ?').get(eventId),
+    };
+  });
+}
+
+/** 撤销申请：仅申请人本人可撤销待复核申请 */
+function cancelReviewRequest(performanceId, requestId, operator) {
+  return withTx(() => {
+    const req = getReviewRequest(performanceId, requestId);
+    if (req.status !== 'pending') throw requestConflict(req);
+    if (req.requested_by !== operator) {
+      throw new HttpError(409, `只能由申请人本人（${req.requested_by}）撤销该申请`, { request: req });
+    }
+    db.prepare(
+      "UPDATE cue_review_requests SET status = 'cancelled', resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?"
+    ).run(operator, req.id);
+    return { request: db.prepare('SELECT * FROM cue_review_requests WHERE id = ?').get(req.id) };
+  });
+}
+
+/** 驳回申请：申请人之外的其他人填写原因驳回 */
+function rejectReviewRequest(performanceId, requestId, operator, reason) {
+  return withTx(() => {
+    const req = getReviewRequest(performanceId, requestId);
+    if (req.status !== 'pending') throw requestConflict(req);
+    if (req.requested_by === operator) {
+      throw new HttpError(409, '申请人请使用撤销；驳回须由其他操作人执行', { request: req });
+    }
+    db.prepare(
+      "UPDATE cue_review_requests SET status = 'rejected', resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), resolve_reason = ? WHERE id = ?"
+    ).run(operator, reason, req.id);
+    return { request: db.prepare('SELECT * FROM cue_review_requests WHERE id = ?').get(req.id) };
+  });
+}
+
 route('POST', '/api/performances/:id/cues/:cueId/fire', (body, p) => {
   const operator = String(body.operator || '').trim().slice(0, 50);
   if (!operator) throw new HttpError(400, '请填写操作人');
-  return recordEvent(Number(p.id), Number(p.cueId), 'fired', operator, null);
+  const perfId = Number(p.id);
+  const cueId = Number(p.cueId);
+  // 需双人复核的提示：触发接口转为登记复核申请，不能绕过复核直接写入触发流水；
+  // 普通提示保持原有行为与响应（{ event }）
+  const { cue } = getPerfCue(perfId, cueId);
+  if (cue.needs_review) return createReviewRequest(perfId, cueId, operator);
+  return recordEvent(perfId, cueId, 'fired', operator, null);
+});
+
+route('POST', '/api/performances/:id/cues/:cueId/review-requests', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  const perfId = Number(p.id);
+  const cueId = Number(p.cueId);
+  const { cue } = getPerfCue(perfId, cueId);
+  if (!cue.needs_review) {
+    throw new HttpError(400, `提示「${cue.label}」未标记需双人复核，可直接触发`);
+  }
+  return createReviewRequest(perfId, cueId, operator);
+});
+
+route('POST', '/api/performances/:id/review-requests/:reqId/confirm', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  return confirmReviewRequest(Number(p.id), Number(p.reqId), operator);
+});
+
+route('POST', '/api/performances/:id/review-requests/:reqId/cancel', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  return cancelReviewRequest(Number(p.id), Number(p.reqId), operator);
+});
+
+route('POST', '/api/performances/:id/review-requests/:reqId/reject', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  if (!reason) throw new HttpError(400, '驳回必须填写原因');
+  return rejectReviewRequest(Number(p.id), Number(p.reqId), operator, reason);
 });
 
 route('POST', '/api/performances/:id/cues/:cueId/skip', (body, p) => {
